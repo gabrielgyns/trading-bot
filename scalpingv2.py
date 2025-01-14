@@ -531,39 +531,37 @@ class TradingBot:
             self.send_telegram_message(f"Erro ao calcular volume: {e}")
             return None
     
-    def check_trend(self, period='1h'):
-        """Verifica a tendência usando médias móveis"""
-        try:
-            candles = self.exchange.fetch_ohlcv(self.symbol, period, limit=100)
-            df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
-            # Médias móveis de 20 e 50 períodos
-            df['MA20'] = df['close'].rolling(window=20).mean()
-            df['MA50'] = df['close'].rolling(window=50).mean()
-            
-            # Tendência de alta: MA20 > MA50
-            is_uptrend = df['MA20'].iloc[-1] > df['MA50'].iloc[-1]
-            
-            return is_uptrend
-        except Exception as e:
-            print(f"Erro ao verificar tendência: {e}")
-            return None
-    
     def get_indicators(self, timeframe='5m', period=14):
+        # Obtém as velas (OHLCV)
         candles = self.exchange.fetch_ohlcv(self.symbol, timeframe, limit=period+1)
         df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
         df['EMA9'] = df['close'].ewm(span=9, adjust=False).mean()
 
+        # Cálculo do RSI
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-
         df['RSI'] = 100 - (100 / (1 + gain / loss))
 
-        df['ATR'] = df['high'] - df['low']
+        # Cálculo do ATR (Average True Range)
+        df['ATR'] = df['high'] - df['low']  # ATR simples, você pode usar uma média ou fórmula ajustada aqui
+        df['ATR'] = df['ATR'].rolling(window=period).mean()  # Média para suavizar
         
-        return df.iloc[-1]
+        # Cálculo do MACD
+        df['EMA_fast'] = df['close'].ewm(span=12, adjust=False).mean()  # EMA de curto prazo
+        df['EMA_slow'] = df['close'].ewm(span=26, adjust=False).mean()  # EMA de longo prazo
+        df['MACD'] = df['EMA_fast'] - df['EMA_slow']  # Diferença entre as EMAs
+        df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()  # Linha de sinal do MACD
+
+        # Retorna os últimos valores
+        return {
+            'RSI': df['RSI'].iloc[-1],
+            'ATR': df['ATR'].iloc[-1],
+            'MACD': df['MACD'].iloc[-1],
+            'Signal_Line': df['Signal_Line'].iloc[-1],
+            'volume': df['volume'].iloc[-1]  # Garantindo que o volume seja retornado
+        }
     ####### FIM INDICADORES DE MERCADO ####################################################
     def cancel_all_orders(self) -> None:
         """
@@ -744,21 +742,18 @@ class TradingBot:
                 return
             
             # Obtem indicadores do mercado: RSI, Volume e Tendência
-            # rsi = self.get_rsi()
-            # volume = self.get_volume()
             indicators = self.get_indicators()
-            is_uptrend = self.check_trend()  # Verifica tendência de alta (check_trend retorna True -> uptrend & False -> downtrend)
 
             # Se houver erro nos dados, ignora a iteração
             if indicators['RSI'] is None or indicators['volume'] is None:
                 print("⚠️ Dados de mercado inválidos. Ignorando esta iteração.")
                 return
 
-            print(f"🔎 RSI: {indicators['RSI']:.2f}, Volume: {indicators['volume']:.2f}, EMA9: {indicators['EMA9']:.2f} e UpTrend: {is_uptrend} - {self.symbol} a {price}")
+            print(f"🔎 RSI: {indicators['RSI']:.2f}, Volume: {indicators['volume']:.2f}, MACD: {indicators['MACD']:.4f}, Signal Line: {indicators['Signal_Line']:.4f}, ATR: {indicators['ATR']} - {self.symbol} a {price}")
 
-            if indicators['RSI'] < 30 and indicators['volume'] > MIN_VOLUME_THRESHOLD and price > indicators['EMA9']:
+            if indicators['RSI'] < 30 and indicators['MACD'] > indicators['Signal_Line']: # Usar ATR > 0 ?
                 self.place_trade('buy', price, trade_size, indicators['ATR'])
-            elif indicators['RSI'] > 70 and indicators['volume'] > MIN_VOLUME_THRESHOLD and price < indicators['EMA9']:
+            elif indicators['RSI'] > 70 and indicators['MACD'] < indicators['Signal_Line']: # Usar ATR > 0 ?
                 self.place_trade('sell', price, trade_size, indicators['ATR'])
 
         except Exception as e:
