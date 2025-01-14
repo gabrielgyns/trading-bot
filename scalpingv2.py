@@ -1,3 +1,7 @@
+import asyncio
+import json
+import threading
+import websockets
 import ccxt
 import time
 import os
@@ -16,18 +20,28 @@ API_SECRET_TESTNET = os.getenv("API_SECRET_TESTNET")
 URL_API_TESTNET = os.getenv("URL_API_TESTNET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BINANCE_WS_URL = os.getenv("BINANCE_WS_URL")
 
+# Configurações
 SIMULATION_MODE = False  # Ativa o modo simulado
+MIN_VOLUME_THRESHOLD = 50000 # Volume mínimo para operar -> 50k
+TAKE_PROFIT = 1.021
+STOP_LOSS = 0.99
+BREAK_EVEN_TRIGGER = 1.007
+TAKE_PROFIT_RATIO = 2.0  # Risco:Recompensa de 2:1
+RISK_PER_TRADE = 0.05  # Risco de 5% da banca por operação
+# PAR_SYMBOL, QUANTIDADE_OPERACAO = "XRP/USDT", 5 # 5 itens
+PAR_SYMBOL, QUANTIDADE_OPERACAO = "ADA/USDT", 10 # 10
+
 
 class TradingBot:
-    def __init__(self, symbol: str, initial_balance: float, risk_per_trade: float = 0.02, max_drawdown: float = 0.1, daily_profit_target: float = 0.3, simulation_mode: bool = True):
+    def __init__(self, symbol: str, initial_balance: float, websocket_client, risk_per_trade: float = 0.02, max_drawdown: float = 0.1, daily_profit_target: float = 0.3, simulation_mode: bool = True):
         self.symbol = symbol            # Símbolo do par de trading
         self.active_position: Optional[Dict[str, Any]] = None   # Posição ativa (None se não houver)
-
+        
+        self.ws = websocket_client  # Instância do WebSocket
         self.bot_running = False    # Iniciar o bot desligado
         self.simulation_mode = simulation_mode      # Modo de simulação
-
-        self.prev_rsi = None  # RSI anterior
 
         """
         Gerenciamento de Risco
@@ -73,7 +87,7 @@ class TradingBot:
                 self.exchange.set_sandbox_mode(True)
 
             self.exchange.fetch_balance()
-            print(f"Conexão estabelecida com {'testnet' if self.simulation_mode else 'produção'}")
+            print(f"🚀 Conexão estabelecida com {'testnet' if self.simulation_mode else 'produção'}")
 
         except Exception as e:
             error_msg = f"Erro ao configurar exchange: {e}"
@@ -152,15 +166,19 @@ class TradingBot:
             /ajuda - Mostra esta mensagem
             """
             self.telegram_bot.reply_to(message, help_text)
-        
-        # Inicia o bot do Telegram em uma thread separada
-        import threading
-        threading.Thread(target=self.telegram_bot.polling, daemon=True).start()
+
+        def polling():
+            try:
+                self.telegram_bot.polling(none_stop=True)
+            except Exception as e:
+                print(f"Erro no polling do Telegram: {e}")
+                
+        threading.Thread(target=polling, daemon=True).start()
 
     def send_status(self):
         """Envia status atual do bot"""
         try:
-            price = self.exchange.fetch_ticker(self.symbol)['last']
+            price = self.ws.get_price()
             rsi = self.get_rsi()
             volume = self.get_volume()
             
@@ -186,7 +204,7 @@ class TradingBot:
             return
             
         try:
-            current_price = self.exchange.fetch_ticker(self.symbol)['last']
+            current_price = self.ws.get_price()
             entry_price = self.active_position['entry_price']
             trade_size = self.active_position['trade_size']  
             
@@ -259,43 +277,58 @@ class TradingBot:
     ####### END - TELEGRAM BOT CONFIG ####################################################
 
     ####### START - TENTATIVA GESTÃO DE RISCO CONFIG ######################################
+    # def calculate_trade_size(self):
+    #     balance = self.exchange.fetch_balance().get('USDT', {}).get('free', 0)
+    #     risk_amount = balance * RISK_PER_TRADE
+    #     last_price = self.ws.get_price()
+    #     trade_size = risk_amount / last_price if last_price else 0
+    #     return max(trade_size, 0.1)
+
     def calculate_trade_size(self):
-        """Calcula o tamanho da ordem baseado no saldo e risco por operação"""
-        try:
-            # Obtém o saldo disponível na moeda base (exemplo: USDT)
-            balance = self.exchange.fetch_balance()
-            available_balance = float(balance.get('USDT', {}).get('free', 0))  # Fallback para evitar erro
+        """Calcula o tamanho da ordem com base no risco e no saldo disponível"""
+        # Obtém o saldo de USDT e outras moedas
+        balance = self.exchange.fetch_balance()
 
-            if available_balance <= 0:
-                self.send_telegram_message("⚠️ Saldo insuficiente para operar.")
-                return 0
+        usdt_balance = balance.get('USDT', {}).get('free', 0)
+        xrp_balance = balance.get('XRP', {}).get('free', 0)
+        
+        # Imprime os saldos para debug
+        print(f"Saldo USDT disponível: {usdt_balance}")
+        print(f"Saldo XRP disponível: {xrp_balance}")
+        
+        # Caso o saldo de USDT seja suficiente, use-o
+        if usdt_balance > 0:
+            available_balance = usdt_balance
+        else:
+            # Se não houver USDT suficiente, use o saldo de XRP
+            price_xrp = self.ws.get_price()  # Preço atual do XRP
+            available_balance = xrp_balance * price_xrp  # Converte o XRP para USDT
 
-            # Calcula o risco por trade (exemplo: 2% do saldo disponível)
-            risk_amount = available_balance * self.risk_per_trade
+        # Calcula o risco baseado no saldo disponível
+        risk_amount = available_balance * RISK_PER_TRADE
+        last_price = self.ws.get_price()
 
-            # Obtém informações do mercado
-            market_info = self.exchange.load_markets().get(self.symbol, {})
-            min_trade_size = market_info.get('limits', {}).get('amount', {}).get('min', 0.001)  # Fallback mínimo
+        if last_price is None:
+            return 0  # Retorna 0 se o preço não for obtido
 
-            # Obtém último preço do ativo
-            last_price = self.exchange.fetch_ticker(self.symbol).get('last', 0)
+        # Calcula o tamanho da ordem baseado no risco e preço atual
+        trade_size = risk_amount / last_price
 
-            if last_price <= 0:
-                self.send_telegram_message("⚠️ Erro ao obter preço do ativo. Ignorando operação.")
-                return 0
+        # Verifica o valor mínimo de transação permitido pela Binance
+        market = self.exchange.market(self.symbol)
+        min_notional = market['limits']['cost']['min']
 
-            # Calcula tamanho da ordem
-            trade_size = risk_amount / last_price
+        # Calcula o valor total da transação
+        total_value = trade_size * last_price
 
-            # Ajusta precisão e verifica se está acima do mínimo
-            trade_size = max(trade_size, min_trade_size)  # Garante um tamanho mínimo
-            trade_size = self.exchange.amount_to_precision(self.symbol, trade_size)
-
-            return float(trade_size)
-
-        except Exception as e:
-            self.send_telegram_message(f"❌ Erro ao calcular tamanho da ordem: {e}")
-            return 0
+        # Ajusta o tamanho da ordem para garantir que atenda ao valor mínimo
+        if total_value < min_notional:
+            # Se o valor da transação for abaixo do mínimo, ajusta o trade_size
+            trade_size = min_notional / last_price
+            print(f"⚠️ Ajustando trade_size para o valor mínimo permitido: {trade_size}")
+        
+        # Garantir que o trade_size não seja muito pequeno
+        return max(trade_size, 0.1)  # Garante que a ordem tenha pelo menos 0.1 moeda
 
     def update_pnl(self, pnl):
         """Atualiza o saldo e verifica os limites de perda e lucro"""
@@ -330,7 +363,7 @@ class TradingBot:
             # Para compra, verifica USDT
             if not self.active_position or self.active_position['side'] == 'buy':
                 available_usdt = float(balance['USDT']['free'])
-                required_usdt = trade_size * float(self.exchange.fetch_ticker(self.symbol)['last'])
+                required_usdt = trade_size * float(self.ws.get_price())
                 
                 if available_usdt < required_usdt:
                     print(f"Saldo USDT insuficiente. Disponível: {available_usdt}, Necessário: {required_usdt}")
@@ -376,7 +409,11 @@ class TradingBot:
             return
         
         try:
-            current_price = self.exchange.fetch_ticker(self.symbol)['last']
+            current_price = self.ws.get_price()
+            if current_price is None:
+                print("⏳ Aguardando preço do WebSocket para verificar posição...")
+                return
+            
             entry_price = self.active_position['entry_price']
             trade_size = self.active_position['trade_size']  
             
@@ -386,7 +423,7 @@ class TradingBot:
             
             if tp_executed: # Se TP foi executado
                 profit = ((tp_executed['price'] - entry_price) / entry_price) * 100
-                profit_absolute = (tp_executed['price'] - entry_price) * float(trade_size)
+                profit_absolute = (tp_executed['price'] - entry_price) * trade_size
                 
                 if self.active_position['side'] == 'sell':
                     profit = -profit
@@ -511,9 +548,45 @@ class TradingBot:
         except Exception as e:
             print(f"Erro ao verificar tendência: {e}")
             return None
-    ####### FIM INDICADORES DE MERCADO ####################################################
     
-    def place_trade(self, side: str, price: float, trade_size: float) -> None:
+    def get_indicators(self, timeframe='5m', period=14):
+        candles = self.exchange.fetch_ohlcv(self.symbol, timeframe, limit=period+1)
+        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        df['EMA9'] = df['close'].ewm(span=9, adjust=False).mean()
+
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+
+        df['RSI'] = 100 - (100 / (1 + gain / loss))
+
+        df['ATR'] = df['high'] - df['low']
+        
+        return df.iloc[-1]
+    ####### FIM INDICADORES DE MERCADO ####################################################
+    def cancel_all_orders(self) -> None:
+        """
+        Cancela todas as ordens ativas manualmente, independente do estado.
+
+        Retorna True se conseguiu cancelar todas as ordens.
+        """
+        try:
+            # Cancela todas as ordens abertas
+            self.exchange.cancel_all_orders(self.symbol)
+            
+            # Reseta o estado do bot
+            self.active_position = None
+            
+            self.send_telegram_message(f"🚫 Todas as ordens restantes foram canceladas para {self.symbol}")
+            print(f"Todas as ordens canceladas para {self.symbol}")
+            
+        except Exception as e:
+            error_msg = f"Erro ao cancelar ordens: {e}"
+            self.send_telegram_message(error_msg)
+            print(error_msg)
+
+    def place_trade(self, side: str, price: float, trade_size: float, atr: float) -> None:
         """Executa uma nova operação com gestão de ordens"""
         try:
             if self.simulation_mode:
@@ -557,13 +630,13 @@ class TradingBot:
                 
                 # Calcula preços TP/SL
                 if side == 'buy':
-                    tp_price = executed_price * float(TAKE_PROFIT)
-                    sl_price = executed_price * float(STOP_LOSS)
+                    tp_price = executed_price + (atr * TAKE_PROFIT_RATIO)
+                    sl_price = executed_price - atr
                     tp_side = 'sell'
                     sl_side = 'sell'
                 else:
-                    tp_price = executed_price * float(STOP_LOSS)  # Invertido para venda
-                    sl_price = executed_price * float(TAKE_PROFIT)  # Invertido para venda
+                    tp_price = executed_price - (atr * TAKE_PROFIT_RATIO)  # Invertido para venda
+                    sl_price = executed_price + atr  # Invertido para venda
                     tp_side = 'buy'
                     sl_side = 'buy'
                 
@@ -636,7 +709,7 @@ class TradingBot:
             self.send_telegram_message(f"❌ Erro ao executar ordem: {str(e)}")
             self.active_position = None
 
-    def trade(self):
+    def trade(self, price: float) -> None:
         """Executa a lógica principal de trading"""
         try:
             if not self.bot_running:
@@ -657,9 +730,9 @@ class TradingBot:
                 return
 
             # Ajusta tamanho da ordem baseado no saldo
-            trade_size = self.calculate_trade_size()
-            if trade_size < 1:
-                self.send_telegram_message("🚨 Valor muito baixo para operar. Aguardando saldo aumentar.")
+            trade_size = QUANTIDADE_OPERACAO # self.calculate_trade_size() # TODO: Corrigir depois esse trade size.
+            if trade_size < 0.1:
+                self.send_telegram_message("🚨 Valor de ordem abaixo do mínimo permitido. Aguardando saldo aumentar.")
                 return
 
             # Verifica posição atual primeiro, para saber se podemos abrir uma nova posição.
@@ -671,64 +744,102 @@ class TradingBot:
                 return
             
             # Obtem indicadores do mercado: RSI, Volume e Tendência
-            rsi = self.get_rsi()
-            price = self.exchange.fetch_ticker(self.symbol)['last']
-            volume = self.get_volume()
-            
-            # Se houver erro nos dados, ignora a iteração
-            if rsi is None or volume is None:
-                return
-        
+            # rsi = self.get_rsi()
+            # volume = self.get_volume()
+            indicators = self.get_indicators()
             is_uptrend = self.check_trend()  # Verifica tendência de alta (check_trend retorna True -> uptrend & False -> downtrend)
 
-            print(f"🔎 RSI: {rsi:.2f}, Volume: {volume:.2f} e UpTrend: {is_uptrend} - {self.symbol} a {price}")
+            # Se houver erro nos dados, ignora a iteração
+            if indicators['RSI'] is None or indicators['volume'] is None:
+                print("⚠️ Dados de mercado inválidos. Ignorando esta iteração.")
+                return
 
-            if self.prev_rsi and self.prev_rsi >= 30 and rsi < 30 and volume > MIN_VOLUME_THRESHOLD and is_uptrend:
-                self.place_trade('buy', price, trade_size)
-            elif self.prev_rsi and self.prev_rsi <= 70 and rsi > 70 and volume > MIN_VOLUME_THRESHOLD and not is_uptrend:
-                self.place_trade('sell', price, trade_size)
-            
-            # Atualiza o RSI anterior
-            self.prev_rsi = rsi
+            print(f"🔎 RSI: {indicators['RSI']:.2f}, Volume: {indicators['volume']:.2f}, EMA9: {indicators['EMA9']:.2f} e UpTrend: {is_uptrend} - {self.symbol} a {price}")
+
+            if indicators['RSI'] < 30 and indicators['volume'] > MIN_VOLUME_THRESHOLD and price > indicators['EMA9']:
+                self.place_trade('buy', price, trade_size, indicators['ATR'])
+            elif indicators['RSI'] > 70 and indicators['volume'] > MIN_VOLUME_THRESHOLD and price < indicators['EMA9']:
+                self.place_trade('sell', price, trade_size, indicators['ATR'])
+
         except Exception as e:
             self.send_telegram_message(f"Erro na execução principal: {e}")
+    
+    async def run(self):
+        """Executa o loop principal do bot"""
+        print("🔄 Iniciando loop principal...")
+        while self.bot_running:
+            try:
+                price = self.ws.get_price()
 
-    def cancel_all_orders(self) -> None:
-        """
-        Cancela todas as ordens ativas manualmente, independente do estado.
+                if price:
+                    self.trade(price)
 
-        Retorna True se conseguiu cancelar todas as ordens.
-        """
-        try:
-            # Cancela todas as ordens abertas
-            self.exchange.cancel_all_orders(self.symbol)
-            
-            # Reseta o estado do bot
-            self.active_position = None
-            
-            self.send_telegram_message(f"🚫 Todas as ordens restantes foram canceladas para {self.symbol}")
-            print(f"Todas as ordens canceladas para {self.symbol}")
-            
-        except Exception as e:
-            error_msg = f"Erro ao cancelar ordens: {e}"
-            self.send_telegram_message(error_msg)
-            print(error_msg)
+                await asyncio.sleep(1)  # Delay entre iterações
+            except Exception as e:
+                print(f"❌ Erro no loop principal: {e}")
+                await asyncio.sleep(5)  # Delay maior em caso de erro
 
-# Configurações
-MIN_VOLUME_THRESHOLD = 50000 # Volume mínimo para operar -> 50k
-TAKE_PROFIT = 1.021
-STOP_LOSS = 0.99
-BREAK_EVEN_TRIGGER = 1.007
+class BinanceWebSocket:
+    def __init__(self, symbol: str):
+        self.symbol = symbol.lower().replace("/", "")
+        self.price = None
+        self.ws_url = f"wss://stream.binance.com:9443/ws/{self.symbol}@ticker"
 
-bot = TradingBot(
-    symbol="XRP/USDT",
-    initial_balance=40,
-    risk_per_trade=0.25,
-    max_drawdown=0.15,
-    daily_profit_target=0.30,
-    simulation_mode=False
-)
+    async def connect(self):
+        """Conecta ao WebSocket da Binance"""
+        while True:
+            try:
+                async with websockets.connect(self.ws_url) as websocket:
+                    async for message in websocket:
+                        data = json.loads(message)
+                        self.price = float(data["c"])
 
-while True:
-    bot.trade()
-    time.sleep(20)
+            except Exception as e:
+                print(f"⚠️ Erro WebSocket: {e}")
+                await asyncio.sleep(5)
+                
+    def get_price(self):
+        """Retorna o preço atualizado pela WebSocket"""
+        return self.price
+
+async def main():
+    print("🚀 Iniciando sistema...")
+
+    # Inicializa WebSocket
+    ws = BinanceWebSocket(PAR_SYMBOL)
+    print("📡 WebSocket inicializado")
+    # threading.Thread(target=lambda: asyncio.run(ws.connect()), daemon=True).start()
+
+    # Inicializa Bot
+    bot = TradingBot(
+        symbol=PAR_SYMBOL,
+        websocket_client=ws,
+        initial_balance=40,
+        risk_per_trade=0.25,
+        max_drawdown=0.15,
+        daily_profit_target=0.30,
+        simulation_mode=False
+    )
+    print("🤖 Bot inicializado")
+
+    # Ativa o bot
+    bot.bot_running = True
+    print("✅ Bot ativado")
+
+    try:
+        await asyncio.gather(
+            ws.connect(),
+            bot.run()
+        )
+    except KeyboardInterrupt:
+        print("\n🛑 Encerrando o bot...")
+    except Exception as e:
+        print(f"❌ Erro: {e}")
+    finally:
+        bot.bot_running = False
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Bot encerrado pelo usuário")
