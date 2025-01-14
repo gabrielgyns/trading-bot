@@ -9,7 +9,7 @@ import pandas as pd
 import telebot
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
 load_dotenv()
 
@@ -108,6 +108,7 @@ class TradingBot:
             KeyboardButton('/status'),
             KeyboardButton('/posicao'),
             KeyboardButton('/resultados_do_dia'),
+            # KeyboardButton('/trocar_par'),
             KeyboardButton('/ajuda'),
             KeyboardButton('/cancelar_ordens'),
         )
@@ -137,8 +138,38 @@ class TradingBot:
             self.send_telegram_message(f"Modo simulação: {'✅' if self.simulation_mode else '❌'}")
         
         @self.telegram_bot.message_handler(commands=['cancelar_ordens'])
-        def cancel_orders(message):
-            self.cancel_all_orders()
+        def cancel_orders_confirmation(message):
+            # Cria botões inline de confirmação
+            markup = InlineKeyboardMarkup()
+            markup.row(
+                InlineKeyboardButton("✅ Sim", callback_data="cancel_confirm"),
+                InlineKeyboardButton("❌ Não", callback_data="cancel_deny")
+            )
+            
+            self.telegram_bot.reply_to(
+                message,
+                "⚠️ Tem certeza que deseja cancelar todas as ordens?",
+                reply_markup=markup
+            )
+        
+        # Handler para os botões de confirmação
+        @self.telegram_bot.callback_query_handler(func=lambda call: True)
+        def callback_handler(call):
+            if call.data == "cancel_confirm":
+                # Executa o cancelamento
+                self.cancel_all_orders()
+                self.telegram_bot.edit_message_text(
+                    "✅ Ordens canceladas com sucesso!",
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id
+                )
+            elif call.data == "cancel_deny":
+                # Cancela a operação
+                self.telegram_bot.edit_message_text(
+                    "❌ Operação cancelada!",
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id
+                )
             
         @self.telegram_bot.message_handler(commands=['status'])
         def get_status(message):
@@ -151,7 +182,27 @@ class TradingBot:
         @self.telegram_bot.message_handler(commands=['resultados_do_dia'])
         def get_pnl_day(message):
             self.send_daily_pnl()
-            
+        
+        @self.telegram_bot.message_handler(commands=['trocar_par'])
+        def change_pair(message):
+            try:
+                # O formato esperado é: /trocar_par BTC/USDT
+                parts = message.text.split()
+                if len(parts) != 2:
+                    self.send_telegram_message("❌ Formato incorreto. Use: /trocar_par SYMBOL/USDT")
+                    return
+                    
+                new_symbol = parts[1].upper()
+                # Valida se o par existe
+                try:
+                    self.exchange.fetch_ticker(new_symbol)
+                    self.change_symbol(new_symbol)
+                except Exception as e:
+                    self.send_telegram_message(f"❌ Par inválido ou não suportado: {new_symbol}")
+                    
+            except Exception as e:
+                self.send_telegram_message(f"❌ Erro ao processar comando: {e}")
+                
         @self.telegram_bot.message_handler(commands=['ajuda'])
         def send_help(message):
             help_text = """
@@ -163,6 +214,7 @@ class TradingBot:
             /status - Mostra status atual do bot
             /posicao - Mostra detalhes da posição atual
             /resultados_do_dia - Mostra o PNL do dia
+            /trocar_par SYMBOL/USDT - Troca o par de trading (ex: /trocar_par BTC/USDT)
             /ajuda - Mostra esta mensagem
             """
             self.telegram_bot.reply_to(message, help_text)
@@ -274,6 +326,35 @@ class TradingBot:
             self.telegram_bot.send_message(TELEGRAM_CHAT_ID, message)  # Usando o bot do Telegram
         except Exception as e:
             print(f"Erro ao enviar mensagem Telegram: {e}")
+    
+    def change_symbol(self, new_symbol: str):
+        """Troca o par de trading"""
+        try:
+            # Primeiro cancela todas as ordens existentes
+            self.cancel_all_orders()
+            
+            # Salva o estado anterior do bot
+            was_running = self.bot_running
+            
+            # Para o bot temporariamente
+            self.bot_running = False
+            
+            # Atualiza o símbolo
+            self.symbol = new_symbol.upper()
+            
+            # Atualiza o WebSocket
+            self.ws.change_symbol(new_symbol.lower().replace("/", ""))
+            
+            # Restaura o estado do bot
+            self.bot_running = was_running
+            
+            self.send_telegram_message(f"✅ Par alterado para {new_symbol}")
+            print(f"Par alterado para {new_symbol}")
+            
+        except Exception as e:
+            self.send_telegram_message(f"❌ Erro ao trocar par: {e}")
+            print(f"Erro ao trocar par: {e}")
+
     ####### END - TELEGRAM BOT CONFIG ####################################################
 
     ####### START - TENTATIVA GESTÃO DE RISCO CONFIG ######################################
@@ -796,6 +877,13 @@ class BinanceWebSocket:
     def get_price(self):
         """Retorna o preço atualizado pela WebSocket"""
         return self.price
+
+    def change_symbol(self, new_symbol: str):
+        """Troca o símbolo do WebSocket"""
+        self.symbol = new_symbol
+        self.ws_url = f"wss://stream.binance.com:9443/ws/{self.symbol}@ticker"
+        self.price = None  # Reseta o preço
+
 
 async def main():
     print("🚀 Iniciando sistema...")
