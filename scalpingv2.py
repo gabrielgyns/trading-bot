@@ -30,8 +30,8 @@ STOP_LOSS = 0.99
 BREAK_EVEN_TRIGGER = 1.007
 TAKE_PROFIT_RATIO = 2.0  # Risco:Recompensa de 2:1
 RISK_PER_TRADE = 0.05  # Risco de 5% da banca por operação
-# PAR_SYMBOL, QUANTIDADE_OPERACAO = "XRP/USDT", 5 # 5 itens
-PAR_SYMBOL, QUANTIDADE_OPERACAO = "ADA/USDT", 10 # 10
+PAR_SYMBOL, QUANTIDADE_OPERACAO = "XRP/USDT", 5 # 5 itens
+# PAR_SYMBOL, QUANTIDADE_OPERACAO = "ADA/USDT", 10 # 10
 
 
 class TradingBot:
@@ -832,9 +832,11 @@ class TradingBot:
 
             print(f"🔎 RSI: {indicators['RSI']:.2f}, Volume: {indicators['volume']:.2f}, MACD: {indicators['MACD']:.4f}, Signal Line: {indicators['Signal_Line']:.4f}, ATR: {indicators['ATR']} - {self.symbol} a {price}")
 
-            if indicators['RSI'] < 30 and indicators['MACD'] > indicators['Signal_Line']: # Usar ATR > 0 ?
+            if indicators['RSI'] < 30 and indicators['volume'] > MIN_VOLUME_THRESHOLD: # Usar ATR > 0 ?
+            # if indicators['RSI'] < 30 and indicators['MACD'] > indicators['Signal_Line']: # Usar ATR > 0 ?
                 self.place_trade('buy', price, trade_size, indicators['ATR'])
-            elif indicators['RSI'] > 70 and indicators['MACD'] < indicators['Signal_Line']: # Usar ATR > 0 ?
+            elif indicators['RSI'] > 70 and indicators['volume'] > MIN_VOLUME_THRESHOLD: # Usar ATR > 0 ?
+            # elif indicators['RSI'] > 70 and indicators['MACD'] < indicators['Signal_Line']: # Usar ATR > 0 ?
                 self.place_trade('sell', price, trade_size, indicators['ATR'])
 
         except Exception as e:
